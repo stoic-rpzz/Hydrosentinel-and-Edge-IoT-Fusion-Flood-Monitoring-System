@@ -15,7 +15,9 @@
             Cup anemometer (reed pulses)           - interrupt
             Capacitive soil moisture               - ADC1
   Edge    : temp/RH-compensated level, rain mm / 1 h / intensity,
-            simple quality flags, calibration version.
+            quality flags, calibration version, FLOOD RISK SCORE + CONFIDENCE.
+  Serial  : open the Serial Monitor (115200, Newline) and type i to enter all sensor
+            values by hand and get the risk score and confidence.
   Cloud   : HTTPS POST (JSON) to Supabase REST table "sensor_readings"
             every 60 s. The Bolt.new dashboard reads the same table.
 
@@ -53,6 +55,14 @@
 #include "secrets.example.h"    // placeholders: the setup portal will ask for WiFi + Supabase
 #endif
 // =========================================================
+
+// --- SITE FLOOD SETTINGS (edit for your location; can also be changed at run time) ---
+const float WARN_LEVEL_CM   = 60.0f;    // water level that starts to worry you
+const float DANGER_LEVEL_CM = 120.0f;   // water level at which the area is flooding
+const int   AREA_EXPOSURE   = 3;        // 1 = high ground ... 5 = very low-lying / vulnerable zone
+
+void serialCommands();                  // defined below (Serial Monitor input mode)
+void printMenu();
 
 // --- PIN DEFINITIONS ---
 #define BME_SDA 21
@@ -237,7 +247,7 @@ void runPortal() {
   server.begin();
 
   uint32_t t0 = millis();
-  while (millis() - t0 < 600000UL) { dnsServer.processNextRequest(); server.handleClient(); delay(2); }
+  while (millis() - t0 < 600000UL) { dnsServer.processNextRequest(); server.handleClient(); serialCommands(); delay(2); }
   ESP.restart();                                 // give up after 10 min and retry normal start-up
 }
 
@@ -277,6 +287,248 @@ bool postReading(const String &json) {
   return ok;
 }
 
+// ---------- Flood risk engine: risk score (0-100) + confidence (0-100 %) ----------
+// A transparent, rule-based PROTOTYPE score. It has not been calibrated or validated for real warnings.
+struct Inputs {
+  float distRawCm = NAN, spreadCm = 0, tempC = NAN, rhPct = NAN, pressHpa = NAN;
+  float tips10 = 0, tips60 = 0, windPulses = 0, intervalS = 60, soilRaw = NAN;
+  float prevLevelCm = NAN, prevMin = 10;       // earlier level + minutes ago (for the trend)
+  float lastReadCm = NAN;                      // previous reading (for the spike check); NAN = use prevLevelCm
+  float warnCm = WARN_LEVEL_CM, dangerCm = DANGER_LEVEL_CM;
+  int   exposure = AREA_EXPOSURE;
+};
+
+struct Result {
+  float c = NAN, distCm = NAN, corrCm = NAN, levelCm = NAN, trend = NAN;
+  float rain1h = 0, rainInt = 0, windMs = 0, soilPct = NAN;
+  float sLevel = 0, sTrend = 0, sRain = 0, sSoil = 0, risk = 0, conf = 100;
+  const char* riskLabel = "LOW";
+  const char* confLabel = "HIGH";
+  String flags, notes;
+};
+
+String fmt(float v, int d = 1) { return isnan(v) ? String("n/a") : String(v, d); }
+
+Result assess(const Inputs& in) {
+  Result r;
+  bool hasT = !isnan(in.tempC), hasRH = !isnan(in.rhPct);
+  if (!hasT) r.flags += "BME_FAIL;";
+  r.c = speedOfSound(hasT ? in.tempC : 25.0f, hasRH ? in.rhPct : 60.0f);
+
+  if (isnan(in.distRawCm) || in.distRawCm <= 0) {
+    r.flags += "NO_ECHO;";
+  } else {
+    float us = (in.distRawCm / 100.0f) * 2.0f / 343.0f * 1e6f;      // echo time at 343 m/s
+    r.distCm  = (us * 1e-6f * r.c / 2.0f) * 100.0f * DIST_SCALE;    // recomputed with the corrected speed
+    r.corrCm  = r.distCm - in.distRawCm;
+    r.levelCm = SENSOR_MOUNT_HEIGHT_CM - r.distCm - ZERO_OFFSET_CM;
+    float spikeRef = isnan(in.lastReadCm) ? in.prevLevelCm : in.lastReadCm;
+    if (in.spreadCm > 5.0f) r.flags += "NOISY_ECHO;";
+    if (r.levelCm < -10 || r.levelCm > SENSOR_MOUNT_HEIGHT_CM) r.flags += "IMPLAUSIBLE;";
+    if (!isnan(spikeRef) && fabsf(r.levelCm - spikeRef) > 30.0f) r.flags += "SPIKE;";
+  }
+  if (hasRH && in.rhPct > 95.0f) r.flags += "HIGH_RH;";
+
+  r.rain1h  = in.tips60 * RAIN_MM_PER_TIP * RAIN_UNDERCATCH_GAIN;
+  r.rainInt = in.tips10 * RAIN_MM_PER_TIP * RAIN_UNDERCATCH_GAIN * 6.0f;
+  float dt = in.intervalS > 0 ? in.intervalS : 60.0f;
+  r.windMs = (in.windPulses / dt) * WIND_MS_PER_HZ;
+  if (!isnan(in.soilRaw))
+    r.soilPct = constrain((float)(SOIL_RAW_DRY - in.soilRaw) * 100.0f / (SOIL_RAW_DRY - SOIL_RAW_WET), 0.0f, 100.0f);
+
+  bool haveLevel = !isnan(r.levelCm);
+  if (r.rainInt > 5.0f && haveLevel && r.levelCm < 1.0f) r.flags += "RAIN_NO_LEVEL;";
+  if (haveLevel && !isnan(in.prevLevelCm) && in.prevMin > 0) r.trend = (r.levelCm - in.prevLevelCm) / in.prevMin * 10.0f;   // cm per 10 min
+
+  // cross-sensor checks: do level, rain and trend tell a consistent story?
+  bool rainy = r.rainInt > 5.0f, dry = r.rainInt < 0.5f && r.rain1h < 1.0f;
+  if (!isnan(r.trend)) {
+    if (r.trend >= 3.0f && dry)    r.flags += "RISE_NO_RAIN;";
+    if (rainy && r.trend <= 0.0f)  r.flags += "RAIN_LEVEL_FLAT;";
+  }
+
+  // ---- risk score: level 45 %, trend 20 %, rain 25 %, soil 10 %, scaled by area exposure ----
+  float warn = fmaxf(in.warnCm, 1.0f), danger = fmaxf(in.dangerCm, warn + 1.0f);
+  if (haveLevel) {
+    float L = fmaxf(r.levelCm, 0.0f);
+    r.sLevel = (L <= warn) ? 50.0f * L / warn : 50.0f + 50.0f * (L - warn) / (danger - warn);   // 50 at warning, 100 at danger
+    r.sLevel = constrain(r.sLevel, 0.0f, 100.0f);
+  }
+  if (!isnan(r.trend)) r.sTrend = constrain(r.trend * 10.0f, 0.0f, 100.0f);                     // +10 cm per 10 min = 100
+  r.sRain = fmaxf(constrain(r.rainInt * 2.0f, 0.0f, 100.0f), constrain(r.rain1h * 2.5f, 0.0f, 100.0f));   // 50 mm/h or 40 mm/h-total = 100
+  if (!isnan(r.soilPct)) r.sSoil = r.soilPct;
+  static const float EXPO[6] = {1.0f, 0.8f, 0.9f, 1.0f, 1.1f, 1.2f};
+  int ex = constrain(in.exposure, 1, 5);
+  r.risk = (0.45f * r.sLevel + 0.20f * r.sTrend + 0.25f * r.sRain + 0.10f * r.sSoil) * EXPO[ex];
+  if (haveLevel && r.levelCm >= danger)    r.risk = fmaxf(r.risk, 80.0f);                         // never understate a high level
+  else if (haveLevel && r.levelCm >= warn) r.risk = fmaxf(r.risk, 45.0f);
+  r.risk = constrain(r.risk, 0.0f, 100.0f);
+  r.riskLabel = r.risk < 25 ? "LOW" : r.risk < 50 ? "MODERATE" : r.risk < 75 ? "HIGH" : "SEVERE";
+
+  if (!haveLevel) r.notes += "No water-level reading, so the level part was scored 0|";
+  else r.notes += "Level " + fmt(r.levelCm) + " cm (warning " + fmt(warn, 0) + ", danger " + fmt(danger, 0) + ")|";
+  if (!isnan(r.trend) && r.trend >= 3.0f) r.notes += "Level rising " + fmt(r.trend) + " cm per 10 min|";
+  if (rainy) r.notes += "Heavy rain: " + fmt(r.rainInt, 0) + " mm/h|";
+  else if (r.rain1h >= 10.0f) r.notes += "Rain in the last hour: " + fmt(r.rain1h) + " mm|";
+  if (!isnan(r.soilPct) && r.soilPct >= 70.0f) r.notes += "Soil is saturated (" + fmt(r.soilPct, 0) + " %), so more runoff|";
+  if (ex >= 4) r.notes += "Low-lying or vulnerable area raises the score|";
+  else if (ex <= 2) r.notes += "Higher ground lowers the score|";
+
+  // ---- confidence: start at 100 %, subtract for missing or conflicting evidence ----
+  float conf = 100.0f;
+  auto has = [&](const char* f) { return r.flags.indexOf(f) >= 0; };
+  auto pen = [&](float v, const char* why) { conf -= v; r.notes += "Confidence -" + String((int)v) + ": " + why + "|"; };
+  if (has("NO_ECHO"))         pen(55, "no water-level reading");
+  if (has("IMPLAUSIBLE"))     pen(40, "level outside the physical range");
+  if (has("NOISY_ECHO"))      pen(15, "noisy echo (fog, spray or wind)");
+  if (has("SPIKE"))           pen(15, "level jumped suddenly");
+  if (has("RAIN_NO_LEVEL"))   pen(20, "heavy rain but no level");
+  if (has("RISE_NO_RAIN"))    pen(15, "level rising without rain (upstream release, blocked drain or sensor fault)");
+  if (has("RAIN_LEVEL_FLAT")) pen(10, "heavy rain but level not rising (drain lag or sensor fault)");
+  if (has("BME_FAIL"))        pen(10, "no temperature or humidity, so the level is less accurate");
+  if (has("HIGH_RH"))         pen(5, "humidity above 95 %");
+  if (isnan(r.trend) && haveLevel) pen(10, "no previous level, so the trend is unknown");
+  if (isnan(r.soilPct))       pen(5, "no soil reading");
+  r.conf = constrain(conf, 0.0f, 100.0f);
+  r.confLabel = r.conf >= 80 ? "HIGH" : r.conf >= 55 ? "MEDIUM" : "LOW";
+
+  if (r.flags.length() == 0) r.flags = "OK";
+  return r;
+}
+
+String resultJson(const Result& r) {             // JSON without the closing brace
+  return "{\"level_cm\":" + num(r.levelCm, 1) + ",\"corrected_distance_cm\":" + num(r.distCm, 1) +
+         ",\"correction_cm\":" + num(r.corrCm, 1) + ",\"speed_of_sound_ms\":" + num(r.c, 1) +
+         ",\"rain_1h_mm\":" + num(r.rain1h, 1) + ",\"rain_intensity_mmh\":" + num(r.rainInt, 1) +
+         ",\"wind_ms\":" + num(r.windMs, 1) + ",\"soil_pct\":" + num(r.soilPct, 0) +
+         ",\"flags\":\"" + r.flags + "\",\"trend_cm10\":" + num(r.trend, 1) +
+         ",\"risk_score\":" + num(r.risk, 0) + ",\"risk_level\":\"" + r.riskLabel +
+         "\",\"confidence_pct\":" + num(r.conf, 0) + ",\"confidence_level\":\"" + r.confLabel +
+         "\",\"notes\":\"" + jsonEsc(r.notes) + "\"";
+}
+
+// ---------- Serial Monitor input mode: type sensor values, get risk score + confidence ----------
+bool haveLast = false;                           // latest assessment from the real sensors
+Inputs lastIn;
+Result lastRes;
+
+void printMenu() {
+  Serial.println(F("\n========== HYDROSENTINEL SERIAL MENU =========="));
+  Serial.println(F("Set the Serial Monitor line ending to 'Newline', type a command, press Enter:"));
+  Serial.println(F("  i  = type in temperature, humidity and all sensor values -> flood risk + confidence"));
+  Serial.println(F("  l  = show the latest assessment from the real sensors"));
+  Serial.println(F("  m  = show this menu"));
+}
+
+void printAssessment(const Inputs& in, const Result& r) {
+  Serial.println();
+  Serial.println(F("=========== HYDROSENTINEL FLOOD ASSESSMENT ==========="));
+  Serial.printf("Water level    : %s cm  (corrected distance %s cm, air correction %s cm)\n", fmt(r.levelCm).c_str(), fmt(r.distCm).c_str(), fmt(r.corrCm).c_str());
+  Serial.printf("Level trend    : %s cm per 10 min\n", fmt(r.trend).c_str());
+  Serial.printf("Rain           : %s mm in the last hour, %s mm/h now\n", fmt(r.rain1h).c_str(), fmt(r.rainInt).c_str());
+  Serial.printf("Wind / soil    : %s m/s, soil moisture %s %%\n", fmt(r.windMs).c_str(), fmt(r.soilPct, 0).c_str());
+  Serial.printf("Speed of sound : %s m/s\n", fmt(r.c).c_str());
+  Serial.printf("Area exposure  : %d of 5   (warning %s cm, danger %s cm)\n", (int)constrain(in.exposure, 1, 5), fmt(in.warnCm, 0).c_str(), fmt(in.dangerCm, 0).c_str());
+  Serial.printf("Data flags     : %s\n", r.flags.c_str());
+  Serial.printf("Score parts    : level %.0f (45%%) | trend %.0f (20%%) | rain %.0f (25%%) | soil %.0f (10%%)\n", r.sLevel, r.sTrend, r.sRain, r.sSoil);
+  Serial.printf("\n>>> FLOOD RISK SCORE : %.0f / 100  (%s)\n", r.risk, r.riskLabel);
+  Serial.printf(">>> CONFIDENCE       : %.0f %%  (%s)\n", r.conf, r.confLabel);
+  Serial.println(F("Why:"));
+  int start = 0; String n = r.notes;
+  while (start < (int)n.length()) {
+    int e = n.indexOf('|', start); if (e < 0) e = n.length();
+    Serial.println("  * " + n.substring(start, e));
+    start = e + 1;
+  }
+  if (r.conf < 55) Serial.println(F("Confidence is LOW: check the sensors before acting on this score."));
+  if (r.risk < 25)      Serial.println(F("Advice: normal monitoring."));
+  else if (r.risk < 50) Serial.println(F("Advice: watch closely and verify the site if rain continues."));
+  else if (r.risk < 75) Serial.println(F("Advice: prepare, alert local responders and verify on site."));
+  else                  Serial.println(F("Advice: act now. Follow official flood warnings and evacuation guidance."));
+  Serial.println(F("(Prototype score, not an official warning.)"));
+}
+
+bool readLineTimeout(String& out, uint32_t ms) {           // reads one typed line; handles \n, \r and \r\n
+  static char prevCh = 0;
+  out = ""; uint32_t t0 = millis();
+  while (millis() - t0 < ms) {
+    while (Serial.available()) {
+      char ch = Serial.read();
+      if (ch == '\n' && prevCh == '\r') { prevCh = ch; continue; }
+      prevCh = ch;
+      if (ch == '\n' || ch == '\r') return true;
+      out += ch;
+    }
+    server.handleClient(); delay(5);
+  }
+  return false;
+}
+
+bool askFloat(int n, int total, const char* label, const char* hint, float& v) {   // false = cancelled
+  Serial.printf("[%d/%d] %s", n, total, label);
+  if (hint[0]) Serial.printf(" - %s", hint);
+  Serial.printf("  [%s]: ", isnan(v) ? "skip" : fmt(v, 2).c_str());
+  String s;
+  if (!readLineTimeout(s, 300000UL)) { Serial.println(F("\n(timed out, input cancelled)")); return false; }
+  s.trim(); Serial.println(s);
+  if (s.length() == 0) return true;                                   // Enter keeps the value in brackets
+  if (s.equalsIgnoreCase("q")) { Serial.println(F("Cancelled.")); return false; }
+  if (s.equalsIgnoreCase("skip") || s == "-") { v = NAN; return true; }
+  char c0 = s[0];
+  if (!(isdigit(c0) || c0 == '-' || c0 == '+' || c0 == '.')) { Serial.println(F("  Not a number, keeping the value in brackets.")); return true; }
+  v = s.toFloat();
+  return true;
+}
+
+void serialGuidedInput() {
+  Inputs in;                                                          // typical starting values
+  in.distRawCm = 150; in.spreadCm = 0; in.tempC = 30; in.rhPct = 70; in.pressHpa = 1006;
+  in.tips10 = 0; in.tips60 = 0; in.windPulses = 0; in.intervalS = 60; in.soilRaw = 2500;
+  in.prevLevelCm = NAN; in.prevMin = 10;
+  float expo = in.exposure;
+  struct Field { const char* label; const char* hint; float* v; };
+  Field f[] = {
+    {"Measured distance (cm)",         "ultrasonic reading, assuming 343 m/s", &in.distRawCm},
+    {"Echo spread (cm)",               "how much the samples varied, 0 = steady", &in.spreadCm},
+    {"Air temperature (C)",            "skip = sensor failed", &in.tempC},
+    {"Humidity (%)",                   "0-100, skip = sensor failed", &in.rhPct},
+    {"Pressure (hPa)",                 "optional, not used in the score", &in.pressHpa},
+    {"Rain gauge tips, last 10 min",   "", &in.tips10},
+    {"Rain gauge tips, last hour",     "", &in.tips60},
+    {"Wind pulses",                    "counted during the interval", &in.windPulses},
+    {"Interval (s)",                   "how long the wind pulses were counted", &in.intervalS},
+    {"Soil sensor raw ADC",            "0-4095, skip = none", &in.soilRaw},
+    {"Previous water level (cm)",      "skip = no trend", &in.prevLevelCm},
+    {"Minutes since previous level",   "for the trend", &in.prevMin},
+    {"Warning level (cm)",             "site threshold", &in.warnCm},
+    {"Danger level (cm)",              "site threshold", &in.dangerCm},
+    {"Area exposure 1-5",              "1 = high ground, 5 = very low-lying", &expo},
+  };
+  const int N = sizeof(f) / sizeof(f[0]);
+  Serial.println(F("\n=== MANUAL INPUT ===  Type a value and press Enter. Enter alone keeps the value in [brackets],"));
+  Serial.println(F("'skip' marks a value as missing, 'q' cancels."));
+  for (int i = 0; i < N; i++) if (!askFloat(i + 1, N, f[i].label, f[i].hint, *f[i].v)) return;
+  in.exposure = (int)(expo + 0.5f);
+  printAssessment(in, assess(in));
+  Serial.println(F("\nType i to enter another set of values, or m for the menu."));
+}
+
+void serialCommands() {
+  if (!Serial.available()) return;
+  int pk = Serial.peek();
+  if (pk == '\n' || pk == '\r') { Serial.read(); return; }            // stray line ending
+  String s;
+  if (!readLineTimeout(s, 2000)) return;
+  s.trim(); s.toLowerCase();
+  if (s == "i" || s == "input")                                    serialGuidedInput();
+  else if (s == "l" || s == "live") {
+    if (haveLast) printAssessment(lastIn, lastRes);
+    else Serial.println(F("No live reading yet. The first one arrives about a minute after start-up."));
+  }
+  else if (s == "m" || s == "menu" || s == "?" || s == "help")     printMenu();
+  else if (s.length())                                             Serial.println(F("Unknown command. Type m for the menu."));
+}
+
 // ---------- Node web app: the page is served by the ESP32 and all processing happens here ----------
 #include "node_ui.h"
 String lastJson = "";                            // latest sensor reading (served at /api/live)
@@ -284,50 +536,26 @@ String lastJson = "";                            // latest sensor reading (serve
 bool hasA(const char* k) { return server.hasArg(k) && server.arg(k).length() > 0; }
 float argF(const char* k, float d) { return hasA(k) ? server.arg(k).toFloat() : d; }
 
-void handleProcess() {                           // POST: raw measurements in, processed result out
+void handleProcess() {                           // POST: raw measurements in, processed result + risk out
   server.sendHeader("Access-Control-Allow-Origin", "*");
-  float tC = argF("temp_c", NAN), rh = argF("humidity_pct", NAN);
-  String flags = "";
-  if (isnan(tC)) flags += "BME_FAIL;";
-  float useT = isnan(tC) ? 25.0f : tC, useRH = isnan(rh) ? 60.0f : rh;
-  float c = speedOfSound(useT, useRH);
+  Inputs in;
+  in.distRawCm = argF("distance_cm", NAN);   in.spreadCm = argF("spread_cm", 0);
+  in.tempC     = argF("temp_c", NAN);        in.rhPct    = argF("humidity_pct", NAN);
+  in.tips10    = argF("rain_tips_10min", 0); in.tips60   = argF("rain_tips_60min", 0);
+  in.windPulses = argF("wind_pulses", 0);    in.intervalS = argF("interval_s", 60);
+  in.soilRaw   = argF("soil_raw", NAN);
+  in.prevLevelCm = argF("prev_level_cm", NAN); in.prevMin = argF("prev_minutes", 10);
+  in.warnCm    = argF("warn_cm", WARN_LEVEL_CM); in.dangerCm = argF("danger_cm", DANGER_LEVEL_CM);
+  in.exposure  = (int)argF("exposure", AREA_EXPOSURE);
+  Result r = assess(in);
 
-  float rawD = argF("distance_cm", NAN), spread = argF("spread_cm", 0);
-  float dist = NAN, level = NAN, corr = NAN;
-  if (isnan(rawD) || rawD <= 0) {
-    flags += "NO_ECHO;";
-  } else {
-    float us = (rawD / 100.0f) * 2.0f / 343.0f * 1e6f;          // back to echo time at 343 m/s
-    dist = (us * 1e-6f * c / 2.0f) * 100.0f * DIST_SCALE;       // recompute with compensated speed
-    corr = dist - rawD;
-    level = SENSOR_MOUNT_HEIGHT_CM - dist - ZERO_OFFSET_CM;
-    if (spread > 5.0) flags += "NOISY_ECHO;";
-    if (level < -10 || level > SENSOR_MOUNT_HEIGHT_CM) flags += "IMPLAUSIBLE;";
-    float prev = argF("prev_level_cm", NAN);
-    if (!isnan(prev) && fabs(level - prev) > 30.0) flags += "SPIKE;";
-  }
-  if (!isnan(rh) && rh > 95.0) flags += "HIGH_RH;";
-
-  float rain1h  = argF("rain_tips_60min", 0) * RAIN_MM_PER_TIP * RAIN_UNDERCATCH_GAIN;
-  float rainInt = argF("rain_tips_10min", 0) * RAIN_MM_PER_TIP * RAIN_UNDERCATCH_GAIN * 6.0f;
-  float dt = argF("interval_s", 60); if (dt <= 0) dt = 60;
-  float windMs = (argF("wind_pulses", 0) / dt) * WIND_MS_PER_HZ;
-  float soil = NAN;
-  if (hasA("soil_raw")) soil = constrain((float)(SOIL_RAW_DRY - argF("soil_raw", 0)) * 100.0f / (SOIL_RAW_DRY - SOIL_RAW_WET), 0.0f, 100.0f);
-  if (rainInt > 5.0 && !isnan(level) && level < 1.0) flags += "RAIN_NO_LEVEL;";
-  if (flags.length() == 0) flags = "OK";
-
-  String j = "{\"level_cm\":" + num(level, 1) + ",\"corrected_distance_cm\":" + num(dist, 1) +
-             ",\"correction_cm\":" + num(corr, 1) + ",\"speed_of_sound_ms\":" + num(c, 1) +
-             ",\"rain_1h_mm\":" + num(rain1h, 1) + ",\"rain_intensity_mmh\":" + num(rainInt, 1) +
-             ",\"wind_ms\":" + num(windMs, 1) + ",\"soil_pct\":" + num(soil, 0) +
-             ",\"flags\":\"" + flags + "\"";
+  String j = resultJson(r);
   if (server.arg("send") == "1") {               // optional: store this result in Supabase
-    String f2 = (flags == "OK") ? String("MANUAL;") : (flags + "MANUAL;");
-    String db = "{\"node_id\":\"" + cfgNode + "\",\"level_cm\":" + num(level, 1) + ",\"distance_cm\":" + num(dist, 1) +
-                ",\"air_temp_c\":" + num(tC, 1) + ",\"humidity_pct\":" + num(rh, 1) +
-                ",\"rain_1h_mm\":" + num(rain1h, 1) + ",\"rain_intensity_mmh\":" + num(rainInt, 1) +
-                ",\"wind_ms\":" + num(windMs, 1) + ",\"soil_pct\":" + num(soil, 0) +
+    String f2 = (r.flags == "OK") ? String("MANUAL;") : (r.flags + "MANUAL;");
+    String db = "{\"node_id\":\"" + cfgNode + "\",\"level_cm\":" + num(r.levelCm, 1) + ",\"distance_cm\":" + num(r.distCm, 1) +
+                ",\"air_temp_c\":" + num(in.tempC, 1) + ",\"humidity_pct\":" + num(in.rhPct, 1) +
+                ",\"rain_1h_mm\":" + num(r.rain1h, 1) + ",\"rain_intensity_mmh\":" + num(r.rainInt, 1) +
+                ",\"wind_ms\":" + num(r.windMs, 1) + ",\"soil_pct\":" + num(r.soilPct, 0) +
                 ",\"quality_flags\":\"" + f2 + "\",\"cal_version\":\"" + String(CAL_VERSION) + "\"}";
     j += String(",\"sent\":") + (postReading(db) ? "true" : "false");
   }
@@ -358,6 +586,7 @@ void setup() {
   Serial.begin(115200);
   delay(500);
   Serial.println("\nHydroSentinel node starting");
+  printMenu();                                   // type i in the Serial Monitor to enter values by hand
 
   loadConfig();
   pinMode(0, INPUT_PULLUP);                      // BOOT button: hold 3 s at power-up to redo WiFi setup
@@ -391,9 +620,11 @@ void setup() {
 
 // ---------- Main loop ----------
 uint32_t lastCycle = 0, lastBucketMs = 0;
+float lvlHist[10]; uint32_t lvlT[10]; uint8_t lvlN = 0, lvlHead = 0;   // level history for the trend
 
 void loop() {
   uint32_t now = millis();
+  serialCommands();                              // Serial Monitor: type i, l or m
 
   // advance rain bucket every minute (independent of send timing)
   if (now - lastBucketMs >= 60000UL) {
@@ -415,67 +646,57 @@ void loop() {
     if (isnan(tC) || isnan(rh)) { tC = NAN; rh = NAN; }
   }
 
-  // ---- Level (compensated) ----
-  String flags = "";
-  float useT = isnan(tC) ? 25.0f : tC;          // fallback assumption if BME280 fails
-  float useRH = isnan(rh) ? 60.0f : rh;
-  if (isnan(tC)) flags += "BME_FAIL;";
-  float cMs = speedOfSound(useT, useRH);
+  // ---- Raw readings (the risk engine applies the air-temperature correction) ----
   float spread; int valid;
-  float distCm = readDistanceMedianCm(cMs, spread, valid);
-  float levelCm = NAN;
-  if (isnan(distCm)) {
-    flags += "NO_ECHO;";
-  } else {
-    distCm = distCm * DIST_SCALE;
-    levelCm = SENSOR_MOUNT_HEIGHT_CM - distCm - ZERO_OFFSET_CM;
-    if (spread > 5.0) flags += "NOISY_ECHO;";                 // fog / spray / wind
-    if (levelCm < -10 || levelCm > SENSOR_MOUNT_HEIGHT_CM) flags += "IMPLAUSIBLE;";
-    if (!isnan(lastLevelCm) && fabs(levelCm - lastLevelCm) > 30.0) flags += "SPIKE;";
-    lastLevelCm = levelCm;
-  }
-  if (!isnan(rh) && rh > 95.0) flags += "HIGH_RH;";
+  float distRaw = readDistanceMedianCm(343.0f, spread, valid);
 
-  // ---- Rain ----
   portENTER_CRITICAL(&mux);
   uint32_t tipsTotal = rainTipsTotal;
   uint32_t wp = windPulses; windPulses = 0;
   portEXIT_CRITICAL(&mux);
+  uint32_t tips60 = 0, tips10 = 0;
+  for (int i = 0; i < 60; i++) tips60 += rainBuckets[i];
+  for (int i = 0; i < 10; i++) tips10 += rainBuckets[(bucketIdx + 60 - i) % 60];
   float rainTotalMm = tipsTotal * RAIN_MM_PER_TIP * RAIN_UNDERCATCH_GAIN;
-  float rain1h = rainLastHourMm();
-  float rainInt = rainIntensityMmh();
 
-  // ---- Wind ----
-  float windMs = (wp / (dtMs / 1000.0f)) * WIND_MS_PER_HZ;
+  // level ~10 minutes ago, for a stable trend (needs at least 5 readings)
+  float basePrev = NAN, baseMin = 10;
+  if (lvlN >= 5) { int oldest = (lvlN < 10) ? 0 : lvlHead; basePrev = lvlHist[oldest]; baseMin = (now - lvlT[oldest]) / 60000.0f; }
 
-  // ---- Soil ----
-  int raw = analogRead(SOIL_PIN);
-  float soilPct = constrain((float)(SOIL_RAW_DRY - raw) * 100.0f / (SOIL_RAW_DRY - SOIL_RAW_WET), 0.0f, 100.0f);
+  Inputs in;
+  in.distRawCm = distRaw; in.spreadCm = isnan(spread) ? 0.0f : spread;
+  in.tempC = tC; in.rhPct = rh; in.pressHpa = hPa;
+  in.tips10 = tips10; in.tips60 = tips60; in.windPulses = wp;
+  in.intervalS = dtMs / 1000.0f; in.soilRaw = analogRead(SOIL_PIN);
+  in.prevLevelCm = basePrev; in.prevMin = baseMin; in.lastReadCm = lastLevelCm;
+  Result r = assess(in);
+  if (!isnan(r.levelCm)) {
+    lastLevelCm = r.levelCm;
+    lvlHist[lvlHead] = r.levelCm; lvlT[lvlHead] = now; lvlHead = (lvlHead + 1) % 10; if (lvlN < 10) lvlN++;
+  }
+  lastIn = in; lastRes = r; haveLast = true;
 
-  // ---- Simple edge cross-check (full fusion happens in dashboard/backend) ----
-  if (rainInt > 5.0 && !isnan(levelCm) && levelCm < 1.0) flags += "RAIN_NO_LEVEL;";
-  if (flags.length() == 0) flags = "OK";
-
-  // ---- Build JSON ----
+  // ---- Build JSON (same columns as the database table) ----
   String json = "{";
   json += "\"node_id\":\"" + cfgNode + "\",";
-  json += "\"level_cm\":" + num(levelCm, 1) + ",";
-  json += "\"distance_cm\":" + num(distCm, 1) + ",";
+  json += "\"level_cm\":" + num(r.levelCm, 1) + ",";
+  json += "\"distance_cm\":" + num(r.distCm, 1) + ",";
   json += "\"air_temp_c\":" + num(tC, 1) + ",";
   json += "\"humidity_pct\":" + num(rh, 1) + ",";
   json += "\"pressure_hpa\":" + num(hPa, 1) + ",";
   json += "\"rain_total_mm\":" + num(rainTotalMm, 1) + ",";
-  json += "\"rain_1h_mm\":" + num(rain1h, 1) + ",";
-  json += "\"rain_intensity_mmh\":" + num(rainInt, 1) + ",";
-  json += "\"wind_ms\":" + num(windMs, 1) + ",";
-  json += "\"soil_pct\":" + num(soilPct, 0) + ",";
-  json += "\"quality_flags\":\"" + flags + "\",";
+  json += "\"rain_1h_mm\":" + num(r.rain1h, 1) + ",";
+  json += "\"rain_intensity_mmh\":" + num(r.rainInt, 1) + ",";
+  json += "\"wind_ms\":" + num(r.windMs, 1) + ",";
+  json += "\"soil_pct\":" + num(r.soilPct, 0) + ",";
+  json += "\"quality_flags\":\"" + r.flags + "\",";
   json += "\"cal_version\":\"" + String(CAL_VERSION) + "\",";
   json += "\"rssi\":" + String(WiFi.RSSI());
   json += "}";
 
   Serial.println(json);
   lastJson = json;
+  Serial.printf("RISK %.0f/100 (%s) | confidence %.0f %% (%s) | type l for details, i to type values by hand\n", r.risk, r.riskLabel, r.conf, r.confLabel);
 
   // ---- Send (with reconnect + 1 retry) ----
   connectWiFi();
